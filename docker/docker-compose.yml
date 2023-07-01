@@ -1,0 +1,16 @@
+version: '3.9'
+
+services:
+  smb:
+    image: smb-image
+    build:
+      context: .
+      dockerfile: smb.Dockerfile
+    stop_grace_period: 1s
+    volumes:
+      - "./vol:/shares/main"
+    environment:
+      - "SAMBA_VOLUME_CONFIG_main=[main];    path = /shares/main;    guest ok = yes;    writeable = yes;    browseable = yes"
+    ports:
+      - "4445:445"
+    privileged: true

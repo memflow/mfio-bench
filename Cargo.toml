@@ -1,0 +1,13 @@
+
+[profile.bench]
+debug = true
+
+[workspace]
+members = [
+	"mfio-bench",
+]
+
+default-members = [
+	"mfio-bench",
+]
+
