@@ -1,0 +1,19 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+VAGRANTFILE_API_VERSION = "2"
+
+Vagrant.configure("2") do |config|
+    config.vm.define "main" do |config|
+        config.vm.box = "generic/arch"
+
+        config.vm.provider "libvirt" do |v|
+            v.memory = 8192
+            v.cpus = 4
+        end
+
+        config.vm.network "forwarded_port", guest: 445, host: 4445
+
+        config.vm.provision "shell", path: "provision.sh"
+    end
+end

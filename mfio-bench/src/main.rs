@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 #[no_mangle]
 static mut FH: *const mfio::stdeq::Seekable<FileWrapper, u64> = core::ptr::null();
 
-const LATENCIES: [usize; 5] = [/*0, */ 1, 2, 5, 10, 20 /*, 50, 100*/];
+const LATENCIES: [usize; 7] = [/*0, */ 1, 2, 5, 10, 20, 50, 100];
 
 trait ReadStrategy {
     fn name(&self) -> String;
@@ -205,6 +205,7 @@ fn file_with_strategy(
 
     #[cfg(target_os = "linux")]
     for latency in LATENCIES {
+        use criterion::async_executor::AsyncExecutor;
         use glommio::io::BufferedFile;
         use glommio::LocalExecutor;
 
@@ -224,44 +225,47 @@ fn file_with_strategy(
         set_latency(latency).unwrap();
 
         group.bench_function(BenchmarkId::new(format!("glommio {name}"), latency), |b| {
-            b.to_async(&glommio).iter_custom(|iters| async move {
+            b.to_async(&glommio).iter_custom(|iters| {
                 let total_iters = total_iters.clone();
-                let mut total_iters = total_iters.lock().unwrap();
+                async move {
+                    let mut total_iters = total_iters.lock().unwrap();
 
-                let mut bufs = vec![vec![0u8; size]; num_chunks];
+                    let mut bufs = vec![vec![0u8; size]; num_chunks];
 
-                // Translate iters represented in latency bytes, to iters represented by size bytes
-                let mut iters = (iters as usize * latency + (size - 1)) / size;
+                    // Translate iters represented in latency bytes, to iters represented by size bytes
+                    let mut iters = (iters as usize * latency + (size - 1)) / size;
 
-                let file = &BufferedFile::open(temp_path).await.unwrap();
+                    let file = &BufferedFile::open(temp_path).await.unwrap();
 
-                let mut elapsed = Duration::default();
+                    let mut elapsed = Duration::default();
 
-                while iters > 0 {
-                    let mut output = vec![];
-                    output.reserve(num_chunks);
+                    while iters > 0 {
+                        let mut output = vec![];
+                        output.reserve(num_chunks);
 
-                    let start = Instant::now();
+                        let start = Instant::now();
 
-                    for b in bufs.iter_mut().take(iters as _) {
-                        let comp = async move {
-                            let res = file
-                                .read_at(strategy.pos(*total_iters, file_len), b.len())
-                                .await
-                                .unwrap();
-                            b.copy_from_slice(&res[..]);
-                        };
-                        output.push(comp);
-                        *total_iters += 1;
-                        iters -= 1;
+                        for b in bufs.iter_mut().take(iters as _) {
+                            let titers = *total_iters;
+                            let comp = async move {
+                                let res = file
+                                    .read_at(strategy.pos(titers, file_len), b.len())
+                                    .await
+                                    .unwrap();
+                                b.copy_from_slice(&res[..]);
+                            };
+                            output.push(comp);
+                            *total_iters += 1;
+                            iters -= 1;
+                        }
+
+                        let _ = futures::future::join_all(output).await;
+
+                        elapsed += start.elapsed();
                     }
 
-                    let _ = futures::future::join_all(output).await;
-
-                    elapsed += start.elapsed();
+                    elapsed
                 }
-
-                elapsed
             });
         });
     }
