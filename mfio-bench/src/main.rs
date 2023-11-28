@@ -1,111 +1,216 @@
-use core::mem::MaybeUninit;
+#[cfg(feature = "hash-check")]
+use crc::{Algorithm, Crc, CRC_32_ISCSI};
 use criterion::*;
-use mfio::traits::*;
-use mfio_fs::*;
+use futures::stream::{FuturesUnordered, StreamExt};
+use mfio::backend::IoBackend;
+use mfio::io::{Packet, PacketIoExt, Write};
+use mfio_rt::*;
 use rand::prelude::*;
+#[cfg(feature = "hash-check")]
+use std::collections::BTreeMap;
 use std::fs::File;
+use std::net::TcpStream;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-#[no_mangle]
-static mut FH: *const mfio::stdeq::Seekable<FileWrapper, u64> = core::ptr::null();
+const LATENCIES: &[usize] = &[1, 2, 5, 10, 20, 50, 100];
+const READ_SIZES: &[usize] = &[0x1, 0x10, 0x100, 0x1000, 0x10000];
+const MB: usize = 0x10000;
 
-const LATENCIES: [usize; 7] = [/*0, */ 1, 2, 5, 10, 20, 50, 100];
+#[derive(Clone, Copy)]
+enum AxisMode {
+    /// X-Axis is represented by simulated latency
+    Latency { read_size: usize },
+    /// X-axis is represented by read size
+    ReadSize { latency: usize },
+}
+
+impl AxisMode {
+    fn iterable(self) -> &'static [usize] {
+        match self {
+            Self::Latency { .. } => &LATENCIES,
+            Self::ReadSize { .. } => &READ_SIZES,
+        }
+    }
+
+    fn read_size(self, iterable: usize) -> usize {
+        match self {
+            Self::Latency { read_size } => read_size,
+            Self::ReadSize { .. } => iterable,
+        }
+    }
+
+    fn latency(self, iterable: usize) -> usize {
+        match self {
+            Self::Latency { .. } => iterable,
+            Self::ReadSize { latency } => latency,
+        }
+    }
+
+    fn num_chunks(self, iterable: usize) -> usize {
+        (64 * MB) / self.read_size(iterable)
+    }
+}
+
+impl core::fmt::Display for AxisMode {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            Self::Latency { read_size } => write!(f, "0x{read_size:x}"),
+            Self::ReadSize { latency } => write!(f, "{latency} ms"),
+        }
+    }
+}
 
 trait ReadStrategy {
     fn name(&self) -> String;
-    fn read_size(&self) -> usize;
-    fn pos(&self, total_iters: usize, file_len: u64) -> u64;
+    fn axis_mode(&self) -> AxisMode;
+    fn pos(&self, total_iters: usize, file_len: u64, read_size: usize) -> u64;
 }
 
-struct SeqStrategy(usize);
+struct SeqStrategy(AxisMode);
 
 impl ReadStrategy for SeqStrategy {
     fn name(&self) -> String {
-        format!("Sequential 0x{:x}", self.0)
+        format!("Sequential {}", self.0)
     }
 
-    fn read_size(&self) -> usize {
+    fn axis_mode(&self) -> AxisMode {
         self.0
     }
 
-    fn pos(&self, total_iters: usize, file_len: u64) -> u64 {
-        (total_iters * self.0) as u64 % (file_len - (self.0 as u64 - 1))
+    fn pos(&self, total_iters: usize, file_len: u64, read_size: usize) -> u64 {
+        (total_iters * read_size) as u64 % (file_len - (read_size as u64 - 1))
     }
 }
 
-struct RevStrategy(usize);
+#[derive(Clone, Copy)]
+struct RevStrategy(AxisMode);
 
 impl ReadStrategy for RevStrategy {
     fn name(&self) -> String {
-        format!("Reverse 0x{:x}", self.0)
+        format!("Reverse {}", self.0)
     }
 
-    fn read_size(&self) -> usize {
+    fn axis_mode(&self) -> AxisMode {
         self.0
     }
 
-    fn pos(&self, total_iters: usize, file_len: u64) -> u64 {
+    fn pos(&self, total_iters: usize, file_len: u64, read_size: usize) -> u64 {
         file_len
-            - self.0 as u64
-            - ((total_iters * self.0) as u64 % (file_len - (self.0 as u64 - 1)))
+            - read_size as u64
+            - ((total_iters * read_size) as u64 % (file_len - (read_size as u64 - 1)))
     }
 }
 
+#[derive(Clone, Copy)]
 struct RandStrategy {
-    read_size: usize,
+    axis_mode: AxisMode,
     seed: u64,
 }
 
 impl RandStrategy {
-    pub fn new(read_size: usize) -> Self {
+    pub fn new(axis_mode: AxisMode) -> Self {
         let mut rng = rand::thread_rng();
         let seed = rng.gen::<u64>();
-        Self { read_size, seed }
+        Self { axis_mode, seed }
     }
 }
 
 impl ReadStrategy for RandStrategy {
     fn name(&self) -> String {
-        format!("Random 0x{:x}", self.read_size)
+        format!("Random {}", self.axis_mode)
     }
 
-    fn read_size(&self) -> usize {
-        self.read_size
+    fn axis_mode(&self) -> AxisMode {
+        self.axis_mode
     }
 
-    fn pos(&self, total_iters: usize, file_len: u64) -> u64 {
+    fn pos(&self, total_iters: usize, file_len: u64, read_size: usize) -> u64 {
         let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(self.seed + total_iters as u64);
-        rng.gen::<u64>() % (file_len - (self.read_size - 1) as u64)
+        rng.gen::<u64>() % (file_len - (read_size - 1) as u64)
     }
 }
 
 fn file_read(c: &mut Criterion) {
     env_logger::init();
 
-    for size in [0x1000] {
+    let mut set_latency_state = None;
+
+    for latency in [1] {
+        let axis_mode = AxisMode::ReadSize { latency };
+
         for strategy in &[
-            Box::new(SeqStrategy(size)) as Box<dyn ReadStrategy>,
-            Box::new(RevStrategy(size)),
-            Box::new(RandStrategy::new(size)),
+            Box::new(SeqStrategy(axis_mode)) as Box<dyn ReadStrategy>,
+            Box::new(RevStrategy(axis_mode)),
+            Box::new(RandStrategy::new(axis_mode)),
         ] {
-            for (name, file) in &[
-                //("local", "vol/sample.img"),
-                //("nfs", "nfs/sample.img"),
-                ("smb", "smb/sample.img"),
+            for (name, file, remote) in &[
+                #[cfg(target_os = "linux")]
+                ("local", "../sample.img", false),
+                //("local", "vol/sample.img", false),
+                //("nfs", "nfs/sample.img", true),
+                //("smb", "smb/sample.img", true),
             ] {
-                file_with_strategy(c, &**strategy, name, file);
+                file_with_strategy(
+                    c,
+                    &**strategy,
+                    if *remote {
+                        Some((
+                            &mut set_latency_state,
+                            crate::set_latency as for<'a> fn(&'a mut _, _) -> _,
+                        ))
+                    } else {
+                        None
+                    },
+                    name,
+                    file,
+                    NativeRt::builder()
+                        .enable_all()
+                        .build_each()
+                        .into_iter()
+                        .filter_map(|(a, b)| Some(a).zip(b.ok())),
+                );
             }
         }
     }
 }
-fn file_with_strategy(
+
+fn set_latency(stream: &mut Option<TcpStream>, latency: usize) -> std::io::Result<()> {
+    use std::io::Write;
+
+    if stream.is_none() {
+        *stream = Some(TcpStream::connect("127.0.0.1:12345")?);
+    }
+
+    let stream = stream.as_mut().unwrap();
+
+    stream.write(format!("{latency}\n").as_bytes())?;
+    stream.flush()?;
+
+    Ok(())
+}
+
+fn drop_cache(path: &Path) -> std::io::Result<()> {
+    std::process::Command::new("/usr/bin/env")
+        .args([
+            "dd",
+            &format!("if={}", path.to_str().unwrap()),
+            "iflag=nocache",
+            "count=0",
+        ])
+        .output()
+        .map(|_| ())
+}
+
+fn file_with_strategy<S>(
     c: &mut Criterion,
     strategy: &(impl ReadStrategy + ?Sized),
+    mut set_latency: Option<(&mut S, fn(&mut S, usize) -> std::io::Result<()>)>,
     name: &str,
     path: &str,
+    mfio_runtimes: impl Iterator<Item = (&'static str, NativeRt)>,
 ) {
     let mut group = c.benchmark_group(strategy.name());
 
@@ -113,98 +218,198 @@ fn file_with_strategy(
 
     group.plot_config(plot_config);
 
-    const MB: usize = 0x10000;
-
     let temp_path = Path::new(path);
-
-    let drop_cache = |path: &Path| {
-        std::process::Command::new("/usr/bin/env")
-            .args([
-                "dd",
-                &format!("if={}", path.to_str().unwrap()),
-                "iflag=nocache",
-                "count=0",
-            ])
-            .output()
-    };
-
-    let mut stream = std::net::TcpStream::connect("127.0.0.1:12345").unwrap();
-
-    let mut set_latency = |latency: usize| {
-        use std::io::Write;
-        stream.write(format!("{latency}\n").as_bytes())?;
-        stream.flush()?;
-        std::io::Result::Ok(())
-    };
 
     let file_len = std::fs::metadata(temp_path).unwrap().len();
 
-    let size = strategy.read_size();
-
-    let num_chunks = (64 * MB) / size;
-
+    let axis_mode = strategy.axis_mode();
     let total_iters = &Arc::new(Mutex::new(0));
 
-    for latency in LATENCIES {
-        // We hack around the throughput plotting by making one loop iteration represent this many
-        // bytes. We then internally scale the iterations to proper value.
-        group.throughput(Throughput::Bytes(latency as u64));
+    #[cfg(feature = "hash-check")]
+    const CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
+    #[cfg(feature = "hash-check")]
+    let checksums: &Mutex<BTreeMap<(u64, usize), u32>> = &Default::default();
+
+    for &iterable in axis_mode.iterable() {
+        group.throughput(Throughput::Bytes(iterable as u64));
+        let size = axis_mode.read_size(iterable);
+        let num_chunks = axis_mode.num_chunks(iterable);
+        let latency = axis_mode.latency(iterable);
 
         drop_cache(temp_path).unwrap();
-        set_latency(latency).unwrap();
+        if let Some((ref mut state, func)) = set_latency {
+            func(state, latency).unwrap();
+        }
 
-        group.bench_function(BenchmarkId::new(format!("mfio {name}"), latency), |b| {
+        let mut bufs = vec![vec![0u8; size]; num_chunks];
+
+        group.bench_function(BenchmarkId::new(format!("std {name}"), iterable), |b| {
             b.iter_custom(|iters| {
                 let total_iters = total_iters.clone();
                 let mut total_iters = total_iters.lock().unwrap();
 
-                let mut bufs = vec![vec![MaybeUninit::uninit(); size]; num_chunks];
+                // Translate iters represented in iterable bytes, to iters represented by
+                // size bytes. This is so, since iterable does not always represent bytes.
+                let mut iters = (iters as usize * iterable + (size - 1)) / size;
 
-                // Translate iters represented in latency bytes, to iters represented by size bytes
-                let mut iters = (iters as usize * latency + (size - 1)) / size;
+                use std::io::{Read, Seek, SeekFrom};
 
                 let mut elapsed = Duration::default();
 
-                NativeFs::default().run(|fs| async move {
-                    let file = fs.open(temp_path, OpenOptions::new().read(true));
-                    unsafe { FH = &file as *const _ };
+                let mut file = File::open(temp_path).unwrap();
 
-                    while iters > 0 {
-                        let mut output = vec![];
-                        output.reserve(num_chunks);
+                while iters > 0 {
+                    file.rewind().unwrap();
 
-                        let start = Instant::now();
+                    let start = Instant::now();
 
-                        let file = &file;
-
-                        for b in bufs.iter_mut().take(iters as _) {
-                            // Issue a direct read @ here, because we want to queue up multiple
-                            // reads and have them all finish concurrently.
-                            let pos = strategy.pos(*total_iters, file_len);
-                            let fut = async move {
-                                let fut = file.read_all(pos, &mut b[..]);
-                                fut.await.unwrap();
-                            };
-                            output.push(fut);
-                            *total_iters += 1;
-                            iters -= 1;
+                    for b in bufs.iter_mut().take(iters as _) {
+                        let pos = strategy.pos(*total_iters, file_len, size);
+                        file.seek(SeekFrom::Start(pos)).unwrap();
+                        file.read_exact(&mut b[..]).unwrap();
+                        #[cfg(feature = "hash-check")]
+                        {
+                            let mut digest = CRC.digest();
+                            digest.update(&b[..]);
+                            checksums
+                                .lock()
+                                .unwrap()
+                                .insert((pos, size), digest.finalize());
                         }
-
-                        let _ = futures::future::join_all(output).await;
-
-                        elapsed += start.elapsed();
+                        *total_iters += 1;
+                        iters -= 1;
                     }
 
-                    elapsed
-                })
+                    elapsed += start.elapsed();
+                }
+
+                elapsed
             });
         });
-
         println!("TOTAL {}", total_iters.lock().unwrap());
     }
 
+    for (rt_name, rt) in mfio_runtimes {
+        for &iterable in axis_mode.iterable() {
+            // We hack around the throughput plotting by making one loop iteration represent this many
+            // bytes. We then internally scale the iterations to proper value.
+            group.throughput(Throughput::Bytes(iterable as u64));
+            let size = axis_mode.read_size(iterable);
+            let num_chunks = axis_mode.num_chunks(iterable);
+            let latency = axis_mode.latency(iterable);
+
+            #[cfg(feature = "hash-check")]
+            {
+                *total_iters.lock().unwrap() = 0;
+            }
+
+            drop_cache(temp_path).unwrap();
+            if let Some((ref mut state, func)) = set_latency {
+                func(state, latency).unwrap();
+            }
+
+            use criterion::async_executor::AsyncExecutor;
+
+            struct MfioRt<'a>(&'a NativeRt);
+
+            impl<'a> AsyncExecutor for MfioRt<'a> {
+                fn block_on<T>(&self, fut: impl core::future::Future<Output = T>) -> T {
+                    self.0.block_on(fut)
+                }
+            }
+
+            let bufs = &(0..num_chunks)
+                .map(|_| Packet::<Write>::new_buf(size))
+                .collect::<Vec<_>>();
+
+            let rt = &rt;
+
+            group.bench_function(
+                BenchmarkId::new(format!("mfio-{rt_name} {name}"), iterable),
+                |b| {
+                    b.to_async(MfioRt(rt)).iter_custom(|iters| {
+                        // We are cloning arcs of bufs. This may be dangerous to do when `reset_err` is
+                        // called, but we are sure right here that we indeed only use the packets once.
+                        let mut bufs = bufs.clone();
+
+                        async move {
+                            let total_iters = total_iters.clone();
+                            let mut total_iters = total_iters.lock().unwrap();
+
+                            // Translate iters represented in iterable bytes, to iters represented by
+                            // size bytes. This is so, since iterable does not always represent bytes.
+                            let mut iters = (iters as usize * iterable + (size - 1)) / size;
+
+                            let file = &rt
+                                .open(temp_path, OpenOptions::new().read(true))
+                                .await
+                                .unwrap();
+
+                            let mut futures = FuturesUnordered::new();
+
+                            let start = Instant::now();
+
+                            loop {
+                                while iters > 0 {
+                                    if let Some(buf) = bufs.pop() {
+                                        iters -= 1;
+                                        futures.push({
+                                            // SAFETY: we have exclusive access to the buffer at the moment
+                                            unsafe { buf.reset_err() };
+                                            // Issue a direct read @ here, because we want to queue up multiple
+                                            // reads and have them all finish concurrently.
+                                            let pos = strategy.pos(*total_iters, file_len, size);
+                                            *total_iters += 1;
+                                            async move { (pos, file.io(pos, buf).await) }
+                                        })
+                                    } else {
+                                        break;
+                                    }
+                                }
+
+                                // TODO: grab all elems without blocking
+                                #[cfg_attr(not(feature = "hash-chack"), allow(unused))]
+                                if let Some((pos, b)) = futures.next().await {
+                                    #[cfg(feature = "hash-check")]
+                                    {
+                                        if let Some(&orig) =
+                                            checksums.lock().unwrap().get(&(pos, size))
+                                        {
+                                            let mut digest = CRC.digest();
+                                            let slice = b.simple_contiguous_slice().unwrap();
+                                            digest.update(slice);
+                                            let digest = digest.finalize();
+                                            assert_eq!(
+                                                digest,
+                                                orig,
+                                                "Checksums do not match (sz - {size} {})",
+                                                slice.len()
+                                            );
+                                        }
+                                    }
+                                    bufs.push(b);
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            start.elapsed()
+                        }
+                    });
+                },
+            );
+
+            println!("TOTAL {}", total_iters.lock().unwrap());
+        }
+    }
+
     #[cfg(target_os = "linux")]
-    for latency in LATENCIES {
+    for &iterable in axis_mode.iterable() {
+        group.throughput(Throughput::Bytes(iterable as u64));
+        let size = axis_mode.read_size(iterable);
+        let num_chunks = axis_mode.num_chunks(iterable);
+        let latency = axis_mode.latency(iterable);
+
         use criterion::async_executor::AsyncExecutor;
         use glommio::io::BufferedFile;
         use glommio::LocalExecutor;
@@ -219,98 +424,199 @@ fn file_with_strategy(
 
         let glommio = GlommioExecutor(LocalExecutor::default());
 
-        group.throughput(Throughput::Bytes(latency as u64));
-
         drop_cache(temp_path).unwrap();
-        set_latency(latency).unwrap();
+        if let Some((ref mut state, func)) = set_latency {
+            func(state, latency).unwrap();
+        }
 
-        group.bench_function(BenchmarkId::new(format!("glommio {name}"), latency), |b| {
+        let bufs = &Mutex::new(vec![vec![0u8; size]; num_chunks]);
+
+        group.bench_function(BenchmarkId::new(format!("glommio {name}"), iterable), |b| {
             b.to_async(&glommio).iter_custom(|iters| {
                 let total_iters = total_iters.clone();
                 async move {
                     let mut total_iters = total_iters.lock().unwrap();
 
-                    let mut bufs = vec![vec![0u8; size]; num_chunks];
+                    let mut bufs = bufs.lock().unwrap();
 
-                    // Translate iters represented in latency bytes, to iters represented by size bytes
-                    let mut iters = (iters as usize * latency + (size - 1)) / size;
+                    // Translate iters represented in iterable bytes, to iters represented by
+                    // size bytes. This is so, since iterable does not always represent bytes.
+                    let mut iters = (iters as usize * iterable + (size - 1)) / size;
 
                     let file = &BufferedFile::open(temp_path).await.unwrap();
 
-                    let mut elapsed = Duration::default();
+                    let mut futures = FuturesUnordered::new();
 
-                    while iters > 0 {
-                        let mut output = vec![];
-                        output.reserve(num_chunks);
+                    let start = Instant::now();
 
-                        let start = Instant::now();
-
-                        for b in bufs.iter_mut().take(iters as _) {
-                            let titers = *total_iters;
-                            let comp = async move {
-                                let res = file
-                                    .read_at(strategy.pos(titers, file_len), b.len())
-                                    .await
-                                    .unwrap();
-                                b.copy_from_slice(&res[..]);
-                            };
-                            output.push(comp);
-                            *total_iters += 1;
-                            iters -= 1;
+                    loop {
+                        while iters > 0 {
+                            if let Some(mut buf) = bufs.pop() {
+                                iters -= 1;
+                                futures.push({
+                                    let pos = strategy.pos(*total_iters, file_len, size);
+                                    *total_iters += 1;
+                                    async move {
+                                        let _res = file.read_at(pos, buf.len()).await.unwrap();
+                                        // Let's not copy the file data to give glommio some
+                                        // advantage.
+                                        //buf.copy_from_slice(&res[..]);
+                                        buf
+                                    }
+                                })
+                            } else {
+                                break;
+                            }
                         }
 
-                        let _ = futures::future::join_all(output).await;
-
-                        elapsed += start.elapsed();
+                        // TODO: grab all elems without blocking
+                        if let Some(b) = futures.next().await {
+                            bufs.push(b);
+                        } else {
+                            break;
+                        }
                     }
 
-                    elapsed
+                    start.elapsed()
                 }
             });
         });
     }
 
-    for latency in LATENCIES {
-        let mut bufs = vec![vec![0u8; size]; num_chunks];
-        group.throughput(Throughput::Bytes(latency as u64));
+    for &iterable in axis_mode.iterable() {
+        group.throughput(Throughput::Bytes(iterable as u64));
+        let size = axis_mode.read_size(iterable);
+        let num_chunks = axis_mode.num_chunks(iterable);
+        let latency = axis_mode.latency(iterable);
 
         drop_cache(temp_path).unwrap();
-        set_latency(latency).unwrap();
+        if let Some((ref mut state, func)) = set_latency {
+            func(state, latency).unwrap();
+        }
 
-        group.bench_function(BenchmarkId::new(format!("std {name}"), latency), |b| {
-            b.iter_custom(|iters| {
-                let total_iters = total_iters.clone();
-                let mut total_iters = total_iters.lock().unwrap();
+        let bufs = &Mutex::new(vec![vec![0u8; size]; num_chunks]);
 
-                // Translate iters represented in latency bytes, to iters represented by size bytes
-                let mut iters = (iters as usize * latency + (size - 1)) / size;
+        group.bench_function(BenchmarkId::new(format!("tokio {name}"), iterable), |b| {
+            b.to_async(tokio::runtime::Runtime::new().unwrap())
+                .iter_custom(|iters| {
+                    let total_iters = total_iters.clone();
+                    async move {
+                        use std::io::SeekFrom;
+                        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+                        let mut total_iters = total_iters.lock().unwrap();
 
-                use std::io::{Read, Seek, SeekFrom};
+                        let mut bufs = bufs.lock().unwrap();
 
-                let mut elapsed = Duration::default();
+                        // Translate iters represented in iterable bytes, to iters represented by
+                        // size bytes. This is so, since iterable does not always represent bytes.
+                        let mut iters = (iters as usize * iterable + (size - 1)) / size;
 
-                let mut file = File::open(temp_path).unwrap();
+                        let file = &mut tokio::fs::File::open(temp_path).await.unwrap();
 
-                while iters > 0 {
-                    file.rewind().unwrap();
+                        let mut elapsed = Duration::default();
 
-                    let start = Instant::now();
+                        while iters > 0 {
+                            file.rewind().await.unwrap();
 
-                    for b in bufs.iter_mut().take(iters as _) {
-                        let pos = strategy.pos(*total_iters, file_len);
-                        file.seek(SeekFrom::Start(pos)).unwrap();
-                        file.read_exact(&mut b[..]).unwrap();
-                        *total_iters += 1;
-                        iters -= 1;
+                            let start = Instant::now();
+
+                            for b in bufs.iter_mut().take(iters as _) {
+                                let titers = *total_iters;
+                                file.seek(SeekFrom::Start(strategy.pos(titers, file_len, size)))
+                                    .await
+                                    .unwrap();
+                                file.read(b).await.unwrap();
+                                *total_iters += 1;
+                                iters -= 1;
+                            }
+
+                            elapsed += start.elapsed();
+                        }
+
+                        elapsed
                     }
-
-                    elapsed += start.elapsed();
-                }
-
-                elapsed
-            });
+                });
         });
-        println!("TOTAL {}", total_iters.lock().unwrap());
+    }
+
+    // compio happens to get stuck somewhere in the middle on linux
+    #[cfg(not(target_os = "linux"))]
+    for &iterable in axis_mode.iterable() {
+        group.throughput(Throughput::Bytes(iterable as u64));
+        let size = axis_mode.read_size(iterable);
+        let num_chunks = axis_mode.num_chunks(iterable);
+        let latency = axis_mode.latency(iterable);
+
+        drop_cache(temp_path).unwrap();
+        if let Some((ref mut state, func)) = set_latency {
+            func(state, latency).unwrap();
+        }
+
+        use compio::runtime::Runtime;
+        use criterion::async_executor::AsyncExecutor;
+
+        struct CompioRuntime(Runtime);
+
+        impl<'a> AsyncExecutor for CompioRuntime {
+            fn block_on<T>(&self, fut: impl core::future::Future<Output = T>) -> T {
+                self.0.block_on(fut)
+            }
+        }
+
+        let bufs = &Mutex::new(vec![vec![0u8; size]; num_chunks]);
+
+        group.bench_function(BenchmarkId::new(format!("compio {name}"), iterable), |b| {
+            b.to_async(CompioRuntime(Runtime::new().unwrap()))
+                .iter_custom(|iters| {
+                    let total_iters = total_iters.clone();
+                    async move {
+                        use compio::{fs::File, io::AsyncReadAtExt};
+                        let mut total_iters = total_iters.lock().unwrap();
+
+                        let mut bufs = bufs.lock().unwrap();
+
+                        // Translate iters represented in iterable bytes, to iters represented by
+                        // size bytes. This is so, since iterable does not always represent bytes.
+                        let mut iters = (iters as usize * iterable + (size - 1)) / size;
+
+                        let file = &File::open(temp_path).await.unwrap();
+
+                        let mut futures = FuturesUnordered::new();
+
+                        let start = Instant::now();
+
+                        loop {
+                            while iters > 0 {
+                                if let Some(mut buf) = bufs.pop() {
+                                    iters -= 1;
+                                    futures.push({
+                                        buf.clear();
+                                        buf.reserve_exact(size);
+                                        let pos = strategy.pos(*total_iters, file_len, size);
+                                        *total_iters += 1;
+                                        async move {
+                                            let (_, buf) =
+                                                file.read_exact_at(buf, pos).await.unwrap();
+                                            buf
+                                        }
+                                    })
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            // TODO: grab all elems without blocking
+                            if let Some(b) = futures.next().await {
+                                bufs.push(b);
+                            } else {
+                                break;
+                            }
+                        }
+
+                        start.elapsed()
+                    }
+                });
+        });
     }
 }
 

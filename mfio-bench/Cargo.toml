@@ -9,17 +9,22 @@ description = "filesystem implementation on mfio"
 
 [dependencies]
 mfio = { version = "0.1", git = "https://github.com/memflow/mfio" }
-mfio-fs = { version = "0.1", git = "https://github.com/memflow/mfio" }
+mfio-rt = { version = "0.1", git = "https://github.com/memflow/mfio" }
+mfio-netfs = { version = "0.1", git = "https://github.com/memflow/mfio" }
 criterion = { version = "0.5", git = "https://github.com/h33p/criterion.rs", branch = "tput2", features = ["async_tokio", "async_smol", "async_futures"] }
+tokio = { version = "1", features = ["full"] }
+compio = { version = "0.9.0-beta.3", features = ["runtime"] }
 rand = "0.8"
 rand_xorshift = "0.3"
 futures = "0.3.28"
-#flume = "0.10"
-#smol = "1"
 env_logger = "0.10"
-sha256 = "1"
+crc = { version = "3", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # We need git version to compile on alpine
 glommio = { version = "0.8", git = "https://github.com/DataDog/glommio", rev = "517326bb2b63b6f6ddcf5deec7a283ee510f44df" }
 
+[features]
+default = []
+# Verify correctness of mfio implementation by comparing hashes of the std implementation.
+hash-check = ["crc"]
