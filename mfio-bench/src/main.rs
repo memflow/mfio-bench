@@ -57,8 +57,8 @@ impl AxisMode {
 impl core::fmt::Display for AxisMode {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
-            Self::Latency { read_size } => write!(f, "0x{read_size:x}"),
-            Self::ReadSize { latency } => write!(f, "{latency} ms"),
+            Self::Latency { read_size } => write!(f, "latency_mode 0x{read_size:x}"),
+            Self::ReadSize { latency } => write!(f, "size_mode {latency}ms"),
         }
     }
 }
@@ -138,40 +138,72 @@ fn file_read(c: &mut Criterion) {
 
     let mut set_latency_state = None;
 
-    for latency in [1] {
-        let axis_mode = AxisMode::ReadSize { latency };
+    let args = std::env::args().collect::<Vec<_>>();
 
-        for strategy in &[
-            Box::new(SeqStrategy(axis_mode)) as Box<dyn ReadStrategy>,
-            Box::new(RevStrategy(axis_mode)),
-            Box::new(RandStrategy::new(axis_mode)),
-        ] {
-            for (name, file, remote) in &[
-                #[cfg(target_os = "linux")]
-                ("local", "../sample.img", false),
-                //("local", "vol/sample.img", false),
-                //("nfs", "nfs/sample.img", true),
-                //("smb", "smb/sample.img", true),
+    if !args.contains(&"latency_mode".into()) {
+        for latency in [1] {
+            let axis_mode = AxisMode::ReadSize { latency };
+
+            for strategy in &[
+                Box::new(SeqStrategy(axis_mode)) as Box<dyn ReadStrategy>,
+                Box::new(RevStrategy(axis_mode)),
+                Box::new(RandStrategy::new(axis_mode)),
             ] {
-                file_with_strategy(
-                    c,
-                    &**strategy,
-                    if *remote {
-                        Some((
-                            &mut set_latency_state,
-                            crate::set_latency as for<'a> fn(&'a mut _, _) -> _,
-                        ))
-                    } else {
-                        None
-                    },
-                    name,
-                    file,
-                    NativeRt::builder()
-                        .enable_all()
-                        .build_each()
-                        .into_iter()
-                        .filter_map(|(a, b)| Some(a).zip(b.ok())),
-                );
+                for (name, file, remote) in &[("local", "vol/sample.img", false)] {
+                    file_with_strategy(
+                        c,
+                        &**strategy,
+                        if *remote {
+                            Some((
+                                &mut set_latency_state,
+                                crate::set_latency as for<'a> fn(&'a mut _, _) -> _,
+                            ))
+                        } else {
+                            None
+                        },
+                        name,
+                        file,
+                        NativeRt::builder()
+                            .enable_all()
+                            .build_each()
+                            .into_iter()
+                            .filter_map(|(a, b)| Some(a).zip(b.ok())),
+                    );
+                }
+            }
+        }
+    }
+
+    if !args.contains(&"size_mode".into()) {
+        for read_size in [0x1, 0x100, 0x10000] {
+            let axis_mode = AxisMode::Latency { read_size };
+
+            for strategy in &[
+                Box::new(SeqStrategy(axis_mode)) as Box<dyn ReadStrategy>,
+                Box::new(RevStrategy(axis_mode)),
+                Box::new(RandStrategy::new(axis_mode)),
+            ] {
+                for (name, file, remote) in &[("smb", "smb/sample.img", true)] {
+                    file_with_strategy(
+                        c,
+                        &**strategy,
+                        if *remote {
+                            Some((
+                                &mut set_latency_state,
+                                crate::set_latency as for<'a> fn(&'a mut _, _) -> _,
+                            ))
+                        } else {
+                            None
+                        },
+                        name,
+                        file,
+                        NativeRt::builder()
+                            .enable_all()
+                            .build_each()
+                            .into_iter()
+                            .filter_map(|(a, b)| Some(a).zip(b.ok())),
+                    );
+                }
             }
         }
     }
@@ -186,7 +218,10 @@ fn set_latency(stream: &mut Option<TcpStream>, latency: usize) -> std::io::Resul
 
     let stream = stream.as_mut().unwrap();
 
-    stream.write(format!("{latency}\n").as_bytes())?;
+    if stream.write(format!("{latency}\n").as_bytes()).is_err() {
+        *stream = TcpStream::connect("127.0.0.1:12345")?;
+        stream.write(format!("{latency}\n").as_bytes())?;
+    }
     stream.flush()?;
 
     Ok(())

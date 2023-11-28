@@ -1,4 +1,4 @@
-# mfio network benchmark suite
+# mfio local and network benchmark suite
 
 This repo consists of the following:
 

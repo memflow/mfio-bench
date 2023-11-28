@@ -79,5 +79,5 @@ exit_handler() {
 
 trap exit_handler SIGTERM SIGQUIT ERR EXIT
 
-cargo run --release -- --bench
+cargo +nightly run --release -- --bench latency_mode
 
