@@ -1,9 +1,10 @@
 #[cfg(feature = "hash-check")]
 use crc::{Algorithm, Crc, CRC_32_ISCSI};
-use criterion::*;
+use criterion::{measurement::Measurement, *};
 use futures::stream::{FuturesUnordered, StreamExt};
 use mfio::backend::IoBackend;
 use mfio::io::{Packet, PacketIoExt, Write};
+use mfio_netfs::*;
 use mfio_rt::*;
 use rand::prelude::*;
 #[cfg(feature = "hash-check")]
@@ -141,6 +142,9 @@ fn file_read(c: &mut Criterion) {
     let args = std::env::args().collect::<Vec<_>>();
 
     if !args.contains(&"latency_mode".into()) {
+        // Reset the latency, just in case
+        let _ = set_latency(&mut set_latency_state, 0);
+
         for latency in [1] {
             let axis_mode = AxisMode::ReadSize { latency };
 
@@ -213,13 +217,17 @@ fn set_latency(stream: &mut Option<TcpStream>, latency: usize) -> std::io::Resul
     use std::io::Write;
 
     if stream.is_none() {
-        *stream = Some(TcpStream::connect("127.0.0.1:12345")?);
+        let addr = std::env::var("SET_LATENCY_ADDR");
+        let addr = addr.as_deref().unwrap_or("127.0.0.1:12345");
+        *stream = Some(TcpStream::connect(addr)?);
     }
 
     let stream = stream.as_mut().unwrap();
 
     if stream.write(format!("{latency}\n").as_bytes()).is_err() {
-        *stream = TcpStream::connect("127.0.0.1:12345")?;
+        let addr = std::env::var("SET_LATENCY_ADDR");
+        let addr = addr.as_deref().unwrap_or("127.0.0.1:12345");
+        *stream = TcpStream::connect(addr)?;
         stream.write(format!("{latency}\n").as_bytes())?;
     }
     stream.flush()?;
@@ -227,6 +235,13 @@ fn set_latency(stream: &mut Option<TcpStream>, latency: usize) -> std::io::Resul
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn drop_cache(_: &Path) -> std::io::Result<()> {
+    // it's nontrivial to drop file cache on windows
+    Ok(())
+}
+
+#[cfg(unix)]
 fn drop_cache(path: &Path) -> std::io::Result<()> {
     std::process::Command::new("/usr/bin/env")
         .args([
@@ -325,116 +340,157 @@ fn file_with_strategy<S>(
     }
 
     for (rt_name, rt) in mfio_runtimes {
-        for &iterable in axis_mode.iterable() {
-            // We hack around the throughput plotting by making one loop iteration represent this many
-            // bytes. We then internally scale the iterations to proper value.
-            group.throughput(Throughput::Bytes(iterable as u64));
-            let size = axis_mode.read_size(iterable);
-            let num_chunks = axis_mode.num_chunks(iterable);
-            let latency = axis_mode.latency(iterable);
+        #[cfg(feature = "hash-check")]
+        {
+            *total_iters.lock().unwrap() = 0;
+        }
 
-            #[cfg(feature = "hash-check")]
-            {
-                *total_iters.lock().unwrap() = 0;
-            }
+        fn mfio_bench<S, R: Fs + IoBackend, M: Measurement<Value = Duration>>(
+            group: &mut BenchmarkGroup<M>,
+            rt: &R,
+            total_iters: &Mutex<usize>,
+            file_len: u64,
+            strategy: &(impl ReadStrategy + ?Sized),
+            axis_mode: AxisMode,
+            set_latency: &mut Option<(&mut S, fn(&mut S, usize) -> std::io::Result<()>)>,
+            temp_path: &Path,
+            rt_name: &str,
+            name: &str,
+        ) {
+            for &iterable in axis_mode.iterable() {
+                // We hack around the throughput plotting by making one loop iteration represent this many
+                // bytes. We then internally scale the iterations to proper value.
+                group.throughput(Throughput::Bytes(iterable as u64));
+                let size = axis_mode.read_size(iterable);
+                let num_chunks = axis_mode.num_chunks(iterable);
+                let latency = axis_mode.latency(iterable);
 
-            drop_cache(temp_path).unwrap();
-            if let Some((ref mut state, func)) = set_latency {
-                func(state, latency).unwrap();
-            }
-
-            use criterion::async_executor::AsyncExecutor;
-
-            struct MfioRt<'a>(&'a NativeRt);
-
-            impl<'a> AsyncExecutor for MfioRt<'a> {
-                fn block_on<T>(&self, fut: impl core::future::Future<Output = T>) -> T {
-                    self.0.block_on(fut)
+                drop_cache(temp_path).unwrap();
+                if let Some((ref mut state, func)) = set_latency {
+                    func(state, latency).unwrap();
                 }
-            }
 
-            let bufs = &(0..num_chunks)
-                .map(|_| Packet::<Write>::new_buf(size))
-                .collect::<Vec<_>>();
+                use criterion::async_executor::AsyncExecutor;
 
-            let rt = &rt;
+                struct MfioRt<'a, R: IoBackend>(&'a R);
 
-            group.bench_function(
-                BenchmarkId::new(format!("mfio-{rt_name} {name}"), iterable),
-                |b| {
-                    b.to_async(MfioRt(rt)).iter_custom(|iters| {
-                        // We are cloning arcs of bufs. This may be dangerous to do when `reset_err` is
-                        // called, but we are sure right here that we indeed only use the packets once.
-                        let mut bufs = bufs.clone();
+                impl<'a, R: IoBackend> AsyncExecutor for MfioRt<'a, R> {
+                    fn block_on<T>(&self, fut: impl core::future::Future<Output = T>) -> T {
+                        self.0.block_on(fut)
+                    }
+                }
 
-                        async move {
-                            let total_iters = total_iters.clone();
-                            let mut total_iters = total_iters.lock().unwrap();
+                let bufs = &(0..num_chunks)
+                    .map(|_| Packet::<Write>::new_buf(size))
+                    .collect::<Vec<_>>();
 
-                            // Translate iters represented in iterable bytes, to iters represented by
-                            // size bytes. This is so, since iterable does not always represent bytes.
-                            let mut iters = (iters as usize * iterable + (size - 1)) / size;
+                group.bench_function(
+                    BenchmarkId::new(format!("mfio-{rt_name} {name}"), iterable),
+                    |b| {
+                        b.to_async(MfioRt(rt)).iter_custom(|iters| {
+                            // We are cloning arcs of bufs. This may be dangerous to do when `reset_err` is
+                            // called, but we are sure right here that we indeed only use the packets once.
+                            let mut bufs = bufs.clone();
 
-                            let file = &rt
-                                .open(temp_path, OpenOptions::new().read(true))
-                                .await
-                                .unwrap();
+                            async move {
+                                let mut total_iters = total_iters.lock().unwrap();
 
-                            let mut futures = FuturesUnordered::new();
+                                // Translate iters represented in iterable bytes, to iters represented by
+                                // size bytes. This is so, since iterable does not always represent bytes.
+                                let mut iters = (iters as usize * iterable + (size - 1)) / size;
 
-                            let start = Instant::now();
+                                let file = &rt
+                                    .open(temp_path, OpenOptions::new().read(true))
+                                    .await
+                                    .unwrap();
 
-                            loop {
-                                while iters > 0 {
-                                    if let Some(buf) = bufs.pop() {
-                                        iters -= 1;
-                                        futures.push({
-                                            // SAFETY: we have exclusive access to the buffer at the moment
-                                            unsafe { buf.reset_err() };
-                                            // Issue a direct read @ here, because we want to queue up multiple
-                                            // reads and have them all finish concurrently.
-                                            let pos = strategy.pos(*total_iters, file_len, size);
-                                            *total_iters += 1;
-                                            async move { (pos, file.io(pos, buf).await) }
-                                        })
+                                let mut futures = FuturesUnordered::new();
+
+                                let start = Instant::now();
+
+                                loop {
+                                    while iters > 0 {
+                                        if let Some(buf) = bufs.pop() {
+                                            iters -= 1;
+                                            futures.push({
+                                                // SAFETY: we have exclusive access to the buffer at the moment
+                                                unsafe { buf.reset_err() };
+                                                // Issue a direct read @ here, because we want to queue up multiple
+                                                // reads and have them all finish concurrently.
+                                                let pos =
+                                                    strategy.pos(*total_iters, file_len, size);
+                                                *total_iters += 1;
+                                                async move { (pos, file.io(pos, buf).await) }
+                                            })
+                                        } else {
+                                            break;
+                                        }
+                                    }
+
+                                    // TODO: grab all elems without blocking
+                                    #[cfg_attr(not(feature = "hash-chack"), allow(unused))]
+                                    if let Some((pos, b)) = futures.next().await {
+                                        #[cfg(feature = "hash-check")]
+                                        {
+                                            if let Some(&orig) =
+                                                checksums.lock().unwrap().get(&(pos, size))
+                                            {
+                                                let mut digest = CRC.digest();
+                                                let slice = b.simple_contiguous_slice().unwrap();
+                                                digest.update(slice);
+                                                let digest = digest.finalize();
+                                                assert_eq!(
+                                                    digest,
+                                                    orig,
+                                                    "Checksums do not match (sz - {size} {})",
+                                                    slice.len()
+                                                );
+                                            }
+                                        }
+                                        bufs.push(b);
                                     } else {
                                         break;
                                     }
                                 }
 
-                                // TODO: grab all elems without blocking
-                                #[cfg_attr(not(feature = "hash-chack"), allow(unused))]
-                                if let Some((pos, b)) = futures.next().await {
-                                    #[cfg(feature = "hash-check")]
-                                    {
-                                        if let Some(&orig) =
-                                            checksums.lock().unwrap().get(&(pos, size))
-                                        {
-                                            let mut digest = CRC.digest();
-                                            let slice = b.simple_contiguous_slice().unwrap();
-                                            digest.update(slice);
-                                            let digest = digest.finalize();
-                                            assert_eq!(
-                                                digest,
-                                                orig,
-                                                "Checksums do not match (sz - {size} {})",
-                                                slice.len()
-                                            );
-                                        }
-                                    }
-                                    bufs.push(b);
-                                } else {
-                                    break;
-                                }
+                                start.elapsed()
                             }
+                        });
+                    },
+                );
 
-                            start.elapsed()
-                        }
-                    });
-                },
+                println!("TOTAL {}", total_iters.lock().unwrap());
+            }
+        }
+
+        mfio_bench(
+            &mut group,
+            &rt,
+            &total_iters,
+            file_len,
+            strategy,
+            axis_mode,
+            &mut set_latency,
+            temp_path,
+            rt_name,
+            name,
+        );
+
+        if let Ok(addr) = std::env::var("MFIO_REMOTE_ADDR") {
+            let rt = NetworkFs::with_fs(addr.parse().unwrap(), rt.into(), true).unwrap();
+
+            mfio_bench(
+                &mut group,
+                &rt,
+                &total_iters,
+                file_len,
+                strategy,
+                axis_mode,
+                &mut set_latency,
+                temp_path,
+                &format!("netfs-{rt_name}"),
+                name,
             );
-
-            println!("TOTAL {}", total_iters.lock().unwrap());
         }
     }
 
@@ -486,7 +542,7 @@ fn file_with_strategy<S>(
 
                     loop {
                         while iters > 0 {
-                            if let Some(mut buf) = bufs.pop() {
+                            if let Some(buf) = bufs.pop() {
                                 iters -= 1;
                                 futures.push({
                                     let pos = strategy.pos(*total_iters, file_len, size);

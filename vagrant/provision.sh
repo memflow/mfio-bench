@@ -5,7 +5,7 @@ pacman -Sy
 pacman -S samba --noconfirm
 
 mkdir -p /shares/main
-dd if=/dev/urandom of=/shares/main/sample.img bs=1G count=16
+dd if=/dev/urandom of=/shares/main/sample.img bs=1G count=8
 
 cat > /etc/samba/smb.conf <<EOF
 # Global parameters
@@ -37,3 +37,11 @@ Server role: ROLE_STANDALONE
 EOF
 
 systemctl enable smb --now
+
+# build mfio-netfs server
+pacman -S rustup git --noconfirm
+rustup toolchain add stable
+git clone https://github.com/memflow/mfio
+cd mfio
+cargo build --release -p mfio-netfs --all-features --bin mfio-netfs-server
+cp target/release/mfio-netfs-server /usr/local/bin/

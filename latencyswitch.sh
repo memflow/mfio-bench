@@ -9,8 +9,8 @@ main_loop() {
     iface="$1"
     prefix="$2"
     while read line; do
-        >&2 echo umount "${start_dir}/smb"
         if [ "$line" = "bench-quit" ]; then
+            >&2 echo umount "${start_dir}/smb"
             for i in $(seq 0 10); do
                 if >&2 umount "${start_dir}/smb"; then
                     >&2 pkill -P "$ourpid" > /dev/null
@@ -40,7 +40,8 @@ socat - TCP-LISTEN:12345,fork,reuseaddr | \
     if [ "$1" = "vagrant" ]; then
         cd vagrant
         main_loop "$2" "sudo" | sudo -u "$SUDO_USER" vagrant ssh
-    else
+    elif [ "$1" = "docker" ]; then
         main_loop "$2" "" | sudo -u "$SUDO_USER" docker exec -i "$3" /bin/sh
+    else
+        main_loop "$2" "" | sudo -u "$SUDO_USER" /bin/sh
     fi
-
