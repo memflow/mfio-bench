@@ -187,6 +187,9 @@ fn file_read(c: &mut Criterion) {
                 Box::new(RevStrategy(axis_mode)),
                 Box::new(RandStrategy::new(axis_mode)),
             ] {
+                // On windows, we expect the smb share to be on Z: drive.
+                #[cfg(windows)]
+                std::env::set_current_dir("Z:\\").unwrap();
                 for (name, file, remote) in &[("smb", "smb/sample.img", true)] {
                     file_with_strategy(
                         c,
